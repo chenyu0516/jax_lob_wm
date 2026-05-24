@@ -69,36 +69,35 @@ def orderbook_preprocess(df: pd.DataFrame):
                 prev_state = current_state
                 continue
 
-            if n_row["action"] != "F":
-                if prev_state is None:
-                    prev_state = current_state
-                    continue
+            if prev_state is None:
+                prev_state = current_state
+                continue
 
-                prev_prices  = [v[0] for v in prev_state.values()]
-                prev_sizes   = [v[1] for v in prev_state.values()]
-                curr_prices  = [v[0] for v in current_state.values()]
-                curr_sizes   = [v[1] for v in current_state.values()]
+            prev_prices  = [v[0] for v in prev_state.values()]
+            prev_sizes   = [v[1] for v in prev_state.values()]
+            curr_prices  = [v[0] for v in current_state.values()]
+            curr_sizes   = [v[1] for v in current_state.values()]
 
-                if prev_prices == curr_prices:
-                    # Only sizes changed — no price level shift
-                    for i, (ps, cs) in enumerate(zip(prev_sizes, curr_sizes)):
-                        change = cs - ps
-                        if change != 0:
-                            delta.append([ts, queue_level(i), change, "C" if change < 0 else "A"])
-                else:
-                    prev_ask    = prev_prices[4:]
-                    curr_ask    = curr_prices[4:]
-                    prev_ask_sz = prev_sizes[4:]
-                    curr_ask_sz = curr_sizes[4:]
+            if prev_prices == curr_prices:
+                # Only sizes changed — no price level shift
+                for i, (ps, cs) in enumerate(zip(prev_sizes, curr_sizes)):
+                    change = cs - ps
+                    if change != 0:
+                        delta.append([ts, queue_level(i), change, "C" if change < 0 else "A"])
+            else:
+                prev_ask    = prev_prices[4:]
+                curr_ask    = curr_prices[4:]
+                prev_ask_sz = prev_sizes[4:]
+                curr_ask_sz = curr_sizes[4:]
 
-                    # Reverse bids so index 0 = best bid
-                    prev_bid    = prev_prices[:4][::-1]
-                    curr_bid    = curr_prices[:4][::-1]
-                    prev_bid_sz = prev_sizes[:4][::-1]
-                    curr_bid_sz = curr_sizes[:4][::-1]
+                # Reverse bids so index 0 = best bid
+                prev_bid    = prev_prices[:4][::-1]
+                curr_bid    = curr_prices[:4][::-1]
+                prev_bid_sz = prev_sizes[:4][::-1]
+                curr_bid_sz = curr_sizes[:4][::-1]
 
-                    delta += scan_side(ts, prev_ask, curr_ask, prev_ask_sz, curr_ask_sz, "ask")
-                    delta += scan_side(ts, prev_bid, curr_bid, prev_bid_sz, curr_bid_sz, "bid")
+                delta += scan_side(ts, prev_ask, curr_ask, prev_ask_sz, curr_ask_sz, "ask")
+                delta += scan_side(ts, prev_bid, curr_bid, prev_bid_sz, curr_bid_sz, "bid")
 
         else:
             # B4: drop the unreliable flag-count condition — T+C action pattern is sufficient
@@ -113,7 +112,7 @@ def orderbook_preprocess(df: pd.DataFrame):
                 # B5: skip non-printable trade records
                 if row.action == "T" and (row.flags & NON_PRINTABLE_FLAG):
                     continue
-                level = (row.depth + 1) if row.side == "A" else -(row.depth + 1)
+                level = -(row.depth + 1) if row.side == "A" else (row.depth + 1)
                 delta.append([ts, level, row.size, row.action])
 
         # O1: roll the buffer forward
