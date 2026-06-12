@@ -17,49 +17,36 @@ the `MMEnv` class.
 The internal state at time $t \in \{0, 1, \dots, T\}$ is
 
 $$
-x_t = (S_t,\; q_t,\; c_t,\; t) \in \mathbb{R} \times \mathbb{Z} \times \mathbb{R} \times \mathbb{N},
+x_t = (S_t,\; q_t,\; c_t) \in \mathbb{R} \times \mathbb{Z} \times \mathbb{R} ,
 $$
 
 where
 - $S_t$ is the **mid-price** (random walk on a tick grid),
 - $q_t$ is the **inventory** (signed integer number of units held),
 - $c_t$ is the **cash** account,
-- $t$ is the **time step** (clock).
 
-The episode is initialized at $x_0 = (S_0, 0, 0, 0)$ with $S_0 = 100$.
+The episode is initialized at $x_0 = (S_0, 0, c_0)$ with $S_0 = 100$ and $c_0 = 1000$
 
 ### 1.2 Action and quote bijection
 
-The agent chooses a discrete action $a_t \in \{0, 1, \dots, K^2 - 1\}$,
-encoding a pair of **quote distances** $(\delta_t^b, \delta_t^a)$ from the
-mid (in tick units):
-
-$$
-\delta_t^b = \left\lfloor a_t / K \right\rfloor + 1, \qquad
-\delta_t^a = (a_t \bmod K) + 1,
-\qquad (\delta_t^b, \delta_t^a) \in \{1, \dots, K\}^2.
-$$
-
-With $K = 5$ the agent has $|\mathcal{A}| = 25$ joint quote choices. The
-posted limit-order prices in tick units are
-
-$$
-P_t^{\text{bid}} = S_t - \delta_t^b \cdot \tau, \qquad
-P_t^{\text{ask}} = S_t + \delta_t^a \cdot \tau,
-$$
-
-where $\tau$ is the tick size (`TICK = 1.0`).
+The agent chooses a discrete action $(a_t,b_t) \in \{0, 1, \dots, K\}^2$
+* $\tau$ is a tick price, 0.01 here
+* $a_t$ stands for placing an ask order at price $S_t + \delta_a = S_t + a_t\times \tau$ 
+* $b_t$ stands for placing an ask order at price $S_t - \delta_b = S_t - b_t\times \tau$ 
 
 ### 1.3 Mid-price dynamics
+#### Dynamic programming
 
 The mid evolves as a discretized random walk on the tick grid:
 
 $$
-S_{t+1} = S_t + \tau \cdot \mathrm{round}(\sigma \, Z_t),
+S_{t+1} = S_t + \tau \cdot \mathrm{round}(\frac{\sigma \, Z_t}{\tau}),
 \qquad Z_t \stackrel{\text{iid}}{\sim} \mathcal{N}(0, 1),
 $$
 
-with volatility $\sigma = 1.0$. Rounding keeps prices on the tick lattice.
+* volatility $\sigma = 1.0$. Rounding keeps prices on the tick lattice.
+* choose initial price $S_0 \in \mathbb{Z}+\frac{1}{2}\tau$
+  * This can guarantee the spread between the best ask and best bid
 
 ### 1.4 Fill kernel (order execution)
 

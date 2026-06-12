@@ -1,321 +1,54 @@
 import pandas as pd
 from datetime import datetime
 import numpy as np
-
+from dataclasses import asdict
 
 import pandas_market_calendars as mcal
 
-def load_raw_feed(path: str) -> pd.DataFrame:
-    """
-    - Read a Databento `.csv` 
-    - Keep only these columns: `ts_recv` (int64 nanoseconds), `action` (ADD/CANCEL/TRADE), `side` (BID/ASK), `price` (int64 in price ticks), `size` (int64), and `bid_sz_00..03` / `ask_sz_00..03` (top-4 queue snapshots).
-    - Discard the first and last 30 minutes of each trading day to exclude open/close artefacts (keep 10:00–15:30 ET).
-    - Return a dataframe sorted ascending by `ts_recv`.
-    """
-    df = pd.read_csv(path)
-    df = filter_trading_hours(df, "ts_recv")
+from dataclasses import dataclass
+from typing import Literal
 
-NON_PRINTABLE_FLAG = 64  # F_TOB, bit 6 — Trade is non-printable
+N_LEVELS = 4
 
+@dataclass
+class BookChange:
+    side:        Literal['bid', 'ask']
+    level:       int   # 0-indexed position in the book
+    price:       int
+    size_delta:  int   # positive = added, negative = removed
 
-def orderbook_preprocess(df: pd.DataFrame):
-    """
-    - Group the event_log by 'ts_recv'
-    - Calculate the best ask/bid
-    - Find the delta between consecutive book states
-    - Aggregate trades, creates
+def parse_side(row, side: str, n_levels: int) -> dict[int, tuple[int, int]]:
+    """Extract {price: (level, size)} for one side, skipping empty levels."""
+    best = row[f'{side}_px_00']
+            
+    return {
+        int(row[f'{side}_px_{i:02d}']): (int(abs(row[f'{side}_px_{i:02d}']-best)*1e-7)+1, int(row[f'{side}_sz_{i:02d}']))
+        for i in range(n_levels)
+        if abs(row[f'{side}_px_{i:02d}']-best) < (n_levels-0.5)*1e7 
+        # only consider the change in first four queue level (each level is a tick away from the previous one)
+        # minus 0.5 to prevent python overflow
+    }
 
-    Returns
-    -------
-    book_states : dict  {ts -> {key: (price, size)}}
-    delta_df    : pd.DataFrame  columns = [ts, level, size, action]
-    """
-    grouped = df.groupby("ts_recv", sort=False)
+def book_diff(old_row, new_row, n_levels: int = N_LEVELS) -> list[BookChange]:
+    """Detecting the difference between two snapshots, N_LEVELS can help you focus on price level in N_LEVELS*ticksize"""
+    changes = []
 
-    book_states = {}
+    for side in ('bid', 'ask'):
+        old_book = parse_side(old_row, side, n_levels)
+        new_book = parse_side(new_row, side, n_levels)
 
-    # O1: rolling 2-slot buffer — delta computation never touches book_states for lookups
-    prev_state = None
+        for price in old_book.keys() | new_book.keys():
+            old_level, old_size = old_book.get(price, (None, 0))
+            new_level, new_size = new_book.get(price, (None, 0))
 
-    delta = []
+            if old_size != new_size:
+                # Prefer the new level; fall back to old if price was removed
+                level = new_level if new_level is not None else old_level
+                changes.append(BookChange(side, level, price, new_size - old_size))
 
-    for ts, temp_df in grouped:
-        last = temp_df.iloc[-1]
-
-        # Record valid end-of-event snapshots that are not trades
-        if (last["flags"] in (128, 130)) and (last["action"] != "T"):
-            # O4: tuples instead of lists — immutable, slightly cheaper to allocate
-            current_state = {
-                "bid_03": (last["bid_px_03"], last["bid_sz_03"]),
-                "bid_02": (last["bid_px_02"], last["bid_sz_02"]),
-                "bid_01": (last["bid_px_01"], last["bid_sz_01"]),
-                "bid_00": (last["bid_px_00"], last["bid_sz_00"]),
-                "ask_00": (last["ask_px_00"], last["ask_sz_00"]),
-                "ask_01": (last["ask_px_01"], last["ask_sz_01"]),
-                "ask_02": (last["ask_px_02"], last["ask_sz_02"]),
-                "ask_03": (last["ask_px_03"], last["ask_sz_03"]),
-            }
-            book_states[ts] = current_state
-        else:
-            continue
-
-        # --- Delta computation ---
-        n_side_mask = temp_df["side"] == "N"
-        if n_side_mask.any():
-            # B3: use the actual N-side row, not blindly iloc[-1]
-            n_row = temp_df[n_side_mask].iloc[-1]
-
-            if n_row.flags == 0:
-                prev_state = current_state
-                continue
-
-            if prev_state is None:
-                prev_state = current_state
-                continue
-
-            prev_prices  = [v[0] for v in prev_state.values()]
-            prev_sizes   = [v[1] for v in prev_state.values()]
-            curr_prices  = [v[0] for v in current_state.values()]
-            curr_sizes   = [v[1] for v in current_state.values()]
-
-            if prev_prices == curr_prices:
-                # Only sizes changed — no price level shift
-                for i, (ps, cs) in enumerate(zip(prev_sizes, curr_sizes)):
-                    change = cs - ps
-                    if change != 0:
-                        delta.append([ts, queue_level(i), change, "C" if change < 0 else "A"])
-            else:
-                prev_ask    = prev_prices[4:]
-                curr_ask    = curr_prices[4:]
-                prev_ask_sz = prev_sizes[4:]
-                curr_ask_sz = curr_sizes[4:]
-
-                # Reverse bids so index 0 = best bid
-                prev_bid    = prev_prices[:4][::-1]
-                curr_bid    = curr_prices[:4][::-1]
-                prev_bid_sz = prev_sizes[:4][::-1]
-                curr_bid_sz = curr_sizes[:4][::-1]
-
-                delta += scan_side(ts, prev_ask, curr_ask, prev_ask_sz, curr_ask_sz, "ask")
-                delta += scan_side(ts, prev_bid, curr_bid, prev_bid_sz, curr_bid_sz, "bid")
-
-        else:
-            # B4: drop the unreliable flag-count condition — T+C action pattern is sufficient
-            is_normal_trade = (
-                len(temp_df) >= 2
-                and temp_df.iloc[-1]["action"] == "C"
-                and temp_df.iloc[-2]["action"] == "T"
-            )
-            rows_to_process = temp_df.iloc[:-1] if is_normal_trade else temp_df
-
-            for row in rows_to_process.itertuples(index=False):
-                # B5: skip non-printable trade records
-                if row.action == "T" and (row.flags & NON_PRINTABLE_FLAG):
-                    continue
-                level = -(row.depth + 1) if row.side == "A" else (row.depth + 1)
-                delta.append([ts, level, row.size, row.action])
-
-        # O1: roll the buffer forward
-        prev_state = current_state
-
-    return book_states, pd.DataFrame(delta, columns=["ts", "level", "size", "action"])
+    return changes
 
 
-def queue_level(i: int) -> int:
-    """Map flat index 0-7 → queue level: -4, -3, -2, -1, +1, +2, +3, +4."""
-    return i - 4 if i < 4 else i - 3
-
-
-def scan_side(ts, prev_px, curr_px, prev_sz, curr_sz, side):
-    """
-    Scan from best price outward.
-    First price difference determines the event type for that level and beyond.
-
-    Returns list of [ts, queue_level, size_change, action].
-    """
-    result = []
-    n = len(prev_px)
-
-    # O2: precompute set once — used in both branches below
-    prev_set = set(prev_px)
-
-    # O3: level helper — eliminates repeated ternary across all branches
-    def _level(i):
-        return (i + 1) if side == "ask" else -(i + 1)
-
-    # Find first position where price differs
-    first_diff = next((i for i in range(n) if prev_px[i] != curr_px[i]), None)
-
-    if first_diff is None:
-        # No price change — only size changes
-        for i, (ps, cs) in enumerate(zip(prev_sz, curr_sz)):
-            change = cs - ps
-            if change != 0:
-                result.append([ts, _level(i), change, "C" if change < 0 else "A"])
-        return result
-
-    prev_price    = prev_px[first_diff]
-    current_price = curr_px[first_diff]
-    price_improved = (current_price < prev_price) if side == "ask" else (current_price > prev_price)
-
-    if price_improved:
-        if current_price not in prev_set:
-            # New best price inserted inside the spread — CREATE event
-            result.append([ts, _level(first_diff), curr_sz[first_diff],
-                           "CREATE_ASK" if side == "ask" else "CREATE_BID"])
-            # All levels from first_diff+1 shifted one step deeper
-            for i in range(first_diff + 1, n):
-                change = curr_sz[i] - prev_sz[i - 1]
-                if change != 0:
-                    result.append([ts, _level(i), change, "C" if change < 0 else "A"])
-        else:
-            # Best level consumed — everything shifted inward
-            result.append([ts, _level(first_diff), -prev_sz[first_diff], "C"])
-            for i in range(first_diff + 1, n):
-                prev_idx = i + 1
-                if prev_idx < n:
-                    change = curr_sz[i] - prev_sz[prev_idx]
-                    if change != 0:
-                        result.append([ts, _level(i), change, "C" if change < 0 else "A"])
-                else:
-                    # Newly revealed deepest level
-                    result.append([ts, _level(i), curr_sz[i], "A"])
-    else:
-        if current_price not in prev_set:
-            # New gap level inserted between existing levels
-            result.append([ts, _level(first_diff), curr_sz[first_diff], "A"])
-            for i in range(first_diff + 1, n):
-                prev_idx = i - 1
-                if prev_idx < n and prev_px[prev_idx] == curr_px[i]:
-                    change = curr_sz[i] - prev_sz[prev_idx]
-                    if change != 0:
-                        result.append([ts, _level(i), change, "C" if change < 0 else "A"])
-        else:
-            result.append([ts, _level(first_diff), -prev_sz[first_diff], "C"])
-            for i in range(first_diff + 1, n):
-                change = curr_sz[i] - prev_sz[i]
-                if change != 0:
-                    result.append([ts, _level(i), change, "C" if change < 0 else "A"])
-
-    return result
-
-
-def convert_book_states(book_states: dict, tick_size: float = 1e7) -> pd.DataFrame:
-    """
-    Convert book_states dict into a structured DataFrame.
-
-    book_states : {ts -> {"bid_00": (price, size), ..., "ask_00": (price, size), ...}}
-    tick_size   : one tick in Databento fixed-point units (1e7 = 1 cent)
-
-    Output columns:
-        ts, spread, imbalance, best_size, q-4, q-3, q-2, q-1, q+1, q+2, q+3, q+4,
-        best_bid_px, best_ask_px
-    """
-    rows = []
-
-    for ts, state in book_states.items():
-        bid_px = [state[f"bid_0{i}"][0] for i in range(4)]
-        bid_sz = [state[f"bid_0{i}"][1] for i in range(4)]
-        ask_px = [state[f"ask_0{i}"][0] for i in range(4)]
-        ask_sz = [state[f"ask_0{i}"][1] for i in range(4)]
-
-        best_bid = bid_px[0]
-        best_ask = ask_px[0]
-
-        if best_bid is None or best_ask is None or pd.isna(best_bid) or pd.isna(best_ask):
-            continue
-
-        spread_ticks = int(round((best_ask - best_bid) / tick_size))
-
-        q_bid1, q_ask1 = bid_sz[0], ask_sz[0]
-        total     = q_bid1 + q_ask1
-        imbalance = (q_bid1 - q_ask1) / total if total > 0 else 0.0
-
-        bid_lookup = {px: sz for px, sz in zip(bid_px, bid_sz) if px is not None and not pd.isna(px)}
-        ask_lookup = {px: sz for px, sz in zip(ask_px, ask_sz) if px is not None and not pd.isna(px)}
-
-        def bid_queue(k):
-            return bid_lookup.get(best_bid - (k - 1) * tick_size, 0)
-
-        def ask_queue(k):
-            return ask_lookup.get(best_ask + (k - 1) * tick_size, 0)
-
-        rows.append({
-            "ts":          ts,
-            "spread":      spread_ticks,
-            "imbalance":   round(imbalance, 4),
-            "best_size":   round(bid_queue(1) + ask_queue(1), 4),  # B1: was missing from columns
-            "q-4":         round(bid_queue(4), 4),
-            "q-3":         round(bid_queue(3), 4),
-            "q-2":         round(bid_queue(2), 4),
-            "q-1":         round(bid_queue(1), 4),
-            "q+1":         round(ask_queue(1), 4),
-            "q+2":         round(ask_queue(2), 4),
-            "q+3":         round(ask_queue(3), 4),
-            "q+4":         round(ask_queue(4), 4),
-            "best_bid_px": best_bid * 1e-9,
-            "best_ask_px": best_ask * 1e-9,
-        })
-
-    # B1: best_size added to columns list
-    return pd.DataFrame(rows, columns=[
-        "ts", "spread", "imbalance", "best_size",
-        "q-4", "q-3", "q-2", "q-1",
-        "q+1", "q+2", "q+3", "q+4",
-        "best_bid_px", "best_ask_px",
-    ])
-
-    
-def aggregate_trades(delta_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    - Group consecutive TRADE rows that share the same `ts_recv` value into one row with summed `size`.
-    - Rationale: a single aggressive order hitting multiple resting orders generates one message per fill; these must be treated as one event for volume estimation.
-    - Implementation: use `groupby` on a "burst ID" that increments whenever `ts_recv` changes or `action != TRADE`. Take the first row's metadata and sum `size`.
-    """
-    trades = delta_df[delta_df["action"] == "T"].copy()
-    
-    # Burst ID: increments when ts changes between consecutive trade rows
-    trades["burst_id"] = (trades["ts"] != trades["ts"].shift()).cumsum()
-    
-    aggregated = trades.groupby("burst_id", sort=False).agg(
-        ts     = ("ts",     "first"),
-        level  = ("level",  "first"),
-        size   = ("size",   "sum"),     # key aggregation
-        action = ("action", "first"),
-    ).reset_index(drop=True)
-    
-    non_trades = delta_df[delta_df["action"] != "T"]
-    return pd.concat([aggregated, non_trades]).sort_values("ts").reset_index(drop=True)
-
-
-def aggregate_creates(delta_df: list) -> list:
-    """
-    Aggregate CREATE events with any Add events at the same ts and level.
-    When a new price level is created, other participants immediately join it —
-    those Add events at the same ts and level should be folded into the Create.
-    
-    Also aggregates consecutive Add events at the same ts and level that
-    follow a Create, even if they appear non-consecutively among other events,
-    as long as they share the same ts.
-    """
-    creates = delta_df[delta_df["action"].isin(["CREATE_ASK", "CREATE_BID"])].copy()
-    others  = delta_df[~delta_df["action"].isin(["CREATE_ASK", "CREATE_BID"])].copy()
-
-    # Burst ID: increments when ts, level, or action changes
-    creates["burst_id"] = (
-        (creates["ts"]     != creates["ts"].shift())     |
-        (creates["level"]  != creates["level"].shift())  |
-        (creates["action"] != creates["action"].shift())
-    ).cumsum()
-
-    aggregated = creates.groupby("burst_id", sort=False).agg(
-        ts     = ("ts",     "first"),
-        level  = ("level",  "first"),
-        size   = ("size",   "sum"),     # accumulate all participants joining new level
-        action = ("action", "first"),
-    ).reset_index(drop=True)
-
-    return pd.concat([aggregated, others]).sort_values("ts").reset_index(drop=True)
 
 def save_processed(df: pd.DataFrame, ticker: str):
     """
@@ -361,3 +94,87 @@ def filter_trading_hours(df: pd.DataFrame, ts_col: str = "ts_recv") -> pd.DataFr
     mask = is_trading_day & is_trading_hours
     
     return df[mask].reset_index(drop=True)
+
+
+
+def get_imbalance_bin(series):
+    """Discretelize the imbalance"""
+    v = series.to_numpy()
+    
+    # Divide by 0.1 and round to fix floating-point precision issues
+    # e.g., -0.1 / 0.1 could be -0.9999... instead of -1.0
+    scaled = np.round(v / 0.1, 8)
+
+    result = np.where(
+        v == 0,                          # bin 0: exactly zero
+        0,
+        np.where(
+            v < 0,
+            np.floor(scaled).astype(int),  # negative: [0.1*i, 0.1*(i+1))
+            np.ceil(scaled).astype(int)    # positive: (0.1*(i-1), 0.1*i]
+        )
+    )
+    return result
+
+
+
+def single_file_processor(dir: str):
+    df = pd.read_csv(dir)
+
+    previous = None
+    events = []  # collect dicts, concat once at the end
+    states = []
+
+    for ts, temp_df in df.groupby('ts_recv'):
+        now = temp_df.iloc[-1].to_dict()
+        
+        ask = parse_side(now, 'ask', n_levels=N_LEVELS)
+        bid = parse_side(now, 'bid', n_levels=N_LEVELS)
+        
+        best_ask = min(ask.keys())
+        best_bid = max(bid.keys())
+        
+        if previous is not None:
+            changes = book_diff(previous, now)        
+            if changes:  # skip empty diffs
+                reduce_reason = 'T' if 'T' in temp_df['action'].values else 'C'
+                
+                is_create = (best_ask < best_ask_p) or (best_bid > best_bid_p)
+                
+                for c in changes:
+                    d = asdict(c)
+                    if d['size_delta'] > 0:
+                        increase_reason = 'E' if (is_create and (d["level"]==1)) else 'A' #Detection for create event
+                        d['action'] = increase_reason
+                    else:
+                        d['action'] = reduce_reason
+                    d['ts'] = ts
+                    d['size_delta'] = abs(d['size_delta'])
+                    events.append(d)
+
+                level_to_size_ask = {level: size for level, size in ask.values()}
+                level_to_size_bid = {-level: size for level, size in bid.values()}
+
+                state = pd.Series(level_to_size_bid | level_to_size_ask).reindex(range(-4, 4+1), fill_value=0)
+
+                state['spread'] = int((best_ask-best_bid)*1e-7)
+                state['imb'] = (state[1]-state[-1])/(state[1]+state[-1])
+                state['best_px'] = (best_ask+best_bid)/2*1e-9
+                
+                states.append(state)
+
+            
+        previous = temp_df.iloc[-1].to_dict()  # always update, even on first iter
+        best_ask_p = best_ask 
+        best_bid_p = best_bid
+        
+    event_df = pd.DataFrame(events, columns=['ts', 'side', 'level', 'price', 'size_delta', 'action'])
+    states_df = pd.DataFrame(states)
+    states_df['ts'] = df['ts_recv'].drop_duplicates(ignore_index=True)
+    states_df.drop(columns=[0], inplace=True)
+    
+    states_df['imb'] = get_imbalance_bin(states_df['imb'])
+    states_df = filter_trading_hours(states_df, 'ts')
+    event_df = filter_trading_hours(event_df, 'ts')
+    
+    return states_df, event_df
