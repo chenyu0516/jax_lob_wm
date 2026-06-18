@@ -2,6 +2,7 @@ import pandas as pd
 from datetime import datetime
 import numpy as np
 from dataclasses import asdict
+from pathlib import Path
 
 import pandas_market_calendars as mcal
 
@@ -48,14 +49,6 @@ def book_diff(old_row, new_row, n_levels: int = N_LEVELS) -> list[BookChange]:
 
     return changes
 
-
-
-def save_processed(df: pd.DataFrame, ticker: str):
-    """
-    - Write the cleaned, annotated dataframe to `data/processed/{ticker}_events.parquet`.
-    - Schema: `[ts_recv, action, side, level, price, size, vol_norm, dt_ns, log10_dt, imb_bin, spread_bin, is_fast]`.
-    """
-    
 
 
 def filter_trading_hours(df: pd.DataFrame, ts_col: str = "ts_recv") -> pd.DataFrame:
@@ -148,7 +141,8 @@ def single_file_processor(dir: str):
                         d['action'] = increase_reason
                     else:
                         d['action'] = reduce_reason
-                    d['ts'] = ts
+                    d['ts_con'] = previous['ts_recv']
+                    d['ts_hap'] = ts
                     d['size_delta'] = abs(d['size_delta'])
                     events.append(d)
 
@@ -168,7 +162,7 @@ def single_file_processor(dir: str):
         best_ask_p = best_ask 
         best_bid_p = best_bid
         
-    event_df = pd.DataFrame(events, columns=['ts', 'side', 'level', 'price', 'size_delta', 'action'])
+    event_df = pd.DataFrame(events, columns=['ts_hap', 'ts_con', 'side', 'level', 'price', 'size_delta', 'action'])
     states_df = pd.DataFrame(states)
     states_df['ts'] = df['ts_recv'].drop_duplicates(ignore_index=True)
     states_df.drop(columns=[0], inplace=True)
@@ -178,3 +172,24 @@ def single_file_processor(dir: str):
     event_df = filter_trading_hours(event_df, 'ts')
     
     return states_df, event_df
+
+
+def batch_process(in_dir: str, out_dir: str):
+    """Do all the data preprocessing for every .csv file in the directory"""
+    directory = Path(in_dir)
+
+    # 2. Find all CSV files (use .rglob('*.csv') to search subfolders too)
+    csv_files = directory.glob('*.csv')
+    sorted_files = sorted(csv_files, key=lambda f: f.name.split('-')[3])
+
+    # 3. Read and combine into a single DataFrame
+    states = []
+    event = []
+    
+    for  f in sorted_files:
+        states_df, event_df = single_file_processor(f)
+        states.append(states_df)
+        event.append(event_df)
+    pd.concat(states, ignore_index=True).to_parquet(f'{out_dir}/states.parquet')
+    pd.concat(event, ignore_index=True).to_parquet(f'{out_dir}/event.parquet')
+    
