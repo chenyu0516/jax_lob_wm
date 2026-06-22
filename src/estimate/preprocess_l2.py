@@ -3,6 +3,7 @@ from datetime import datetime
 import numpy as np
 from dataclasses import asdict
 from pathlib import Path
+from tqdm import tqdm
 
 import pandas_market_calendars as mcal
 
@@ -118,7 +119,8 @@ def single_file_processor(dir: str):
     events = []  # collect dicts, concat once at the end
     states = []
 
-    for ts, temp_df in df.groupby('ts_recv'):
+    for ts, temp_df in tqdm(df.groupby('ts_recv', sort=False), total=df['ts_recv'].nunique(), desc='Processing'):
+
         now = temp_df.iloc[-1].to_dict()
         
         ask = parse_side(now, 'ask', n_levels=N_LEVELS)
@@ -130,35 +132,33 @@ def single_file_processor(dir: str):
         if previous is not None:
             changes = book_diff(previous, now)        
             if changes:  # skip empty diffs
-                reduce_reason = 'T' if 'T' in temp_df['action'].values else 'C'
+                reduce_reason = 'T' if (temp_df['action'] == 'T').any() else 'C'
                 
                 is_create = (best_ask < best_ask_p) or (best_bid > best_bid_p)
                 
                 for c in changes:
-                    d = asdict(c)
-                    if d['size_delta'] > 0:
-                        increase_reason = 'E' if (is_create and (d["level"]==1)) else 'A' #Detection for create event
-                        d['action'] = increase_reason
-                    else:
-                        d['action'] = reduce_reason
-                    d['ts_con'] = previous['ts_recv']
-                    d['ts_hap'] = ts
-                    d['size_delta'] = abs(d['size_delta'])
-                    events.append(d)
+                    sd = c.size_delta
+                    action = ('E' if (is_create and c.level == 1) else 'A') if sd > 0 else reduce_reason
+                    events.append({
+                        'ts_hap': ts, 'ts_con': previous['ts_recv'],
+                        'side': c.side, 'level': c.level, 'price': c.price,
+                        'size_delta': abs(sd), 'action': action,
+                    })
 
-                level_to_size_ask = {level: size for level, size in ask.values()}
-                level_to_size_bid = {-level: size for level, size in bid.values()}
+                levels = range(-N_LEVELS, N_LEVELS+1)
+                state = {lv: 0 for lv in levels}
+                state.update({level: size for level, size in ask.values()})
+                state.update({-level: size for level, size in bid.values()})
 
-                state = pd.Series(level_to_size_bid | level_to_size_ask).reindex(range(-4, 4+1), fill_value=0)
-
-                state['spread'] = int((best_ask-best_bid)*1e-7)
-                state['imb'] = (state[1]-state[-1])/(state[1]+state[-1])
-                state['best_px'] = (best_ask+best_bid)/2*1e-9
-                
+                bid1, ask1 = state[-1], state[1]
+                denom = ask1 + bid1
+                state['spread'] = int((best_ask - best_bid) * 1e-7)
+                state['imb'] = (ask1 - bid1) / denom if denom != 0 else 2
+                state['best_px'] = (best_ask + best_bid) / 2 * 1e-9
                 states.append(state)
 
             
-        previous = temp_df.iloc[-1].to_dict()  # always update, even on first iter
+        previous = now  # always update, even on first iter
         best_ask_p = best_ask 
         best_bid_p = best_bid
         
@@ -166,7 +166,7 @@ def single_file_processor(dir: str):
     states_df = pd.DataFrame(states)
     states_df['ts'] = df['ts_recv'].drop_duplicates(ignore_index=True)
     states_df.drop(columns=[0], inplace=True)
-    
+        
     states_df['imb'] = get_imbalance_bin(states_df['imb'])
     states_df = filter_trading_hours(states_df, 'ts')
     event_df = filter_trading_hours(event_df, 'ts')
@@ -186,10 +186,14 @@ def batch_process(in_dir: str, out_dir: str):
     states = []
     event = []
     
-    for  f in sorted_files:
+    batch_len = len(sorted_files)
+    for i, f in enumerate(sorted_files):
+        print(f"Batch file process: {i}/{batch_len}")
+        
         states_df, event_df = single_file_processor(f)
         states.append(states_df)
         event.append(event_df)
+        
     pd.concat(states, ignore_index=True).to_parquet(f'{out_dir}/states.parquet')
     pd.concat(event, ignore_index=True).to_parquet(f'{out_dir}/event.parquet')
     

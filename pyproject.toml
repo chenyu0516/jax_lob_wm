@@ -10,30 +10,27 @@ dependencies = [
     # see Step 4 for the CUDA/TPU override.
     "jax>=0.7.0",
     "jaxlib>=0.7.0",
-
     # JAX utility libraries
     "chex==0.1.91",          # dataclasses that register as JAX pytrees
     "flax==0.12.7",          # alternative struct.dataclass; NNX for RL
     "optax==0.2.8",          # gradient-based optimisation (RL training)
-
     # ── Gymnax ─────────────────────────────────────────────────────────────
     # gymnax 0.0.9 is the latest release and targets jax 0.4.x.
     # If gymnax releases a 0.1.x with jax 0.5+ support, update both together.
     "gymnax==0.0.9",
-
     # ── Estimation pipeline (offline, NumPy/SciPy) ─────────────────────────
     "numpy>=1.26,<2.1",       # jax 0.4.35 requires numpy <2.1
     "scipy>=1.13,<2.0",
     "scikit-learn==1.8.0",    # GaussianMixture for GMM timing fit
-
     # ── Data I/O ───────────────────────────────────────────────────────────
     "databento==0.75.0",      # Databento Python client for MBP-10 data
     "pandas==2.2.3",          # event dataframe processing
     "pyarrow==18.1.0",        # parquet read/write for processed events
-
     # ── Visualisation and notebooks ────────────────────────────────────────
     "matplotlib==3.9.4",
     "ipykernel==6.29.5",      # Jupyter kernel registration
+    "nbformat==5.10.4",
+    "plotly==5.24.1",
 ]
 
 [project.optional-dependencies]
